@@ -798,30 +798,25 @@ function wbGuardArchive(archPath, promptText, cfgLabel) {
   const currentBody = wbGetMemoryBlockBody(archText).trim();
   const raw = wbParseRawJson(archText);
   const rawVersion = raw ? raw.version : null;
-  const rawBlock = raw ? String(raw.memoryBlock || "").trim() : null;
 
   let needsRebuild = false;
   let reasons = [];
 
-  // 检查 1: Memory Block 段内容是否与提示词一致
+  // 检查 1: Memory Block 段内容是否与提示词一致（这是 WorkBuddy 实际注入系统提示词的内容）
   if (currentBody !== expectedBody) {
     needsRebuild = true;
     reasons.push("MemoryBlock 内容不一致");
   }
 
-  // 检查 2: RAW_JSON 的 version 是否还是 999999
+  // 检查 2: RAW_JSON 的 version 是否还是 999999（防云覆写锁）
   if (rawVersion !== WB_MEM_VERSION) {
     needsRebuild = true;
     reasons.push("version=" + rawVersion + "(应为" + WB_MEM_VERSION + ")");
   }
 
-  // 检查 3: RAW_JSON 的 memoryBlock 是否与提示词一致
-  if (rawBlock !== null && rawBlock !== expectedBody) {
-    needsRebuild = true;
-    reasons.push("RAW_JSON.memoryBlock 不一致");
-  }
-
-  // 检查 4: RAW_JSON 块本身是否存在
+  // 检查 3: RAW_JSON 块本身是否存在（不需要检查 memoryBlock 字段内容，
+  // 因为 WorkBuddy 运行时会往 memoryBlock 追加用户记忆、转换换行符 \n→\r\n，
+  // 强制比对这个字段会导致每 5 秒无意义重建，覆盖用户记忆）
   if (!raw) {
     needsRebuild = true;
     reasons.push("RAW_JSON 缺失");
