@@ -545,6 +545,27 @@ function writeUtf8Atomic(filePath, text) {
   }
 }
 
+/** 带重试的原子写：WorkBuddy 运行时可能短暂锁文件，重试 2 次提高成功率。 */
+function writeUtf8WithRetry(filePath, text, retries) {
+  if (retries === undefined) retries = 2;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      writeUtf8Atomic(filePath, text);
+      return true;
+    } catch (e) {
+      if (i < retries) {
+        // 等 300ms 再重试（不阻塞主线程）
+        const start = Date.now();
+        while (Date.now() - start < 300) { /* busy wait */ }
+      } else {
+        guardPush("写入失败(已重试" + retries + "次): " + path.basename(filePath) + " - " + String(e.message));
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
 function readUtf8Safe(filePath) {
   try { return fs.readFileSync(filePath, "utf8"); } catch { return null; }
 }
@@ -826,11 +847,14 @@ function wbGuardArchive(archPath, promptText, cfgLabel) {
   try {
     // 先解除只读（如果有的话）
     try { fs.chmodSync(archPath, 0o666); } catch {}
-    writeUtf8Atomic(archPath, newContent);
+    const ok = writeUtf8WithRetry(archPath, newContent);
     // 重新设只读（防云回写）
     try { fs.chmodSync(archPath, 0o444); } catch {}
-    guardPush("WorkBuddy " + cfgLabel + ": " + path.basename(archPath) + " 已重建 (" + reasons.join(", ") + ")");
-    return true;
+    if (ok) {
+      guardPush("WorkBuddy " + cfgLabel + ": " + path.basename(archPath) + " 已重建 (" + reasons.join(", ") + ")");
+      return true;
+    }
+    return false;
   } catch (e) {
     guardPush("WorkBuddy " + cfgLabel + ": " + path.basename(archPath) + " 重建失败: " + String(e.message));
     return false;
@@ -866,11 +890,13 @@ function wbGuardAppConfig(cfgFile, cfgLabel) {
 }
 
 /** 检查并修复 MEMORY.md。
- *  策略：安装状态下（state 文件存在），MEMORY.md 必须与提示词一致。
- *  WorkBuddy 可能在运行时改写 MEMORY.md（写入 AI 笔记等），导致破甲失效。
- *  只要内容不匹配就恢复，安装前原始备份已由 install-workbuddy.ps1 存到 .bak-inject。
+ *  策略：state 文件存在 = 用户已安装破甲 = MEMORY.md 必须与提示词一致。
+ *  安装脚本已把原始 MEMORY.md 备份到 .bak-inject，用户可用「装回原始记忆」恢复。
+ *  所以 state 存在时无条件恢复，不需要保守跳过。
  */
 function wbGuardMemoryFile(memFile, promptText, cfgLabel, stateExists) {
+  if (!stateExists) return;  // 没安装过，绝不碰用户的 MEMORY.md
+
   const text = readUtf8Safe(memFile);
   if (text === null) return;
   const expected = promptText.trim();
@@ -878,29 +904,16 @@ function wbGuardMemoryFile(memFile, promptText, cfgLabel, stateExists) {
 
   if (current === expected) return;
 
-  // 没有 state 文件 = 没安装过，不碰用户的 MEMORY.md
-  if (!stateExists) return;
-
-  // 有 state 文件 = 已安装，MEMORY.md 被覆写了 → 恢复
-  // 但如果内容不含寒霜标记且 .bak-inject 不存在 → 可能是用户自己写的，保守跳过
-  const hasMarker = text.includes("寒霜") || text.includes("HANSHUANG");
-  const hasBackup = fs.existsSync(memFile + ".bak-inject");
-  const isEmpty = current.length === 0;
-
-  if (!hasMarker && !hasBackup && !isEmpty) {
-    // 可能是用户自己的 MEMORY.md，且没有安装前备份 → 不碰
-    return;
-  }
-
-  try {
-    writeUtf8Atomic(memFile, promptText.trimEnd() + "\n");
-    guardPush("WorkBuddy " + cfgLabel + ": MEMORY.md 已恢复（内容被覆写）");
-  } catch (e) {
-    guardPush("WorkBuddy " + cfgLabel + ": MEMORY.md 恢复失败: " + String(e.message));
-  }
+  // state 存在 + 内容不匹配 = 被覆写了 → 无条件恢复
+  writeUtf8WithRetry(memFile, promptText.trimEnd() + "\n");
+  guardPush("WorkBuddy " + cfgLabel + ": MEMORY.md 已恢复（内容被覆写）");
 }
 
 /** WorkBuddy 守护主函数。 */
+// 跨用户目录缓存：扫描 C:\Users\* 比较慢，60 秒刷新一次足够
+let wbCrossUserDirs = null;
+let wbCrossUserScannedAt = 0;
+
 function guardWorkbuddy() {
   // 查找所有可能的配置目录
   const cfgDirs = [];
@@ -912,18 +925,26 @@ function guardWorkbuddy() {
     if (fs.existsSync(dir)) cfgDirs.push({ dir, label: name });
   }
 
-  // 2. 其他用户目录（管理员运行时 $env:USERPROFILE 可能不是真实用户）
-  const usersRoot = path.join(home.charAt(0) + ":\\", "Users");
-  try {
-    for (const u of fs.readdirSync(usersRoot)) {
-      for (const name of [".workbuddy", ".workbuddy-ai"]) {
-        const dir = path.join(usersRoot, u, name);
-        if (fs.existsSync(dir) && !cfgDirs.some(c => c.dir === dir)) {
-          cfgDirs.push({ dir, label: name + "(" + u + ")" });
+  // 2. 其他用户目录（缓存 60 秒，避免每 5 秒扫一遍 C:\Users\*）
+  const nowMs = Date.now();
+  if (!wbCrossUserDirs || (nowMs - wbCrossUserScannedAt) > 60000) {
+    wbCrossUserDirs = [];
+    const usersRoot = path.join(home.charAt(0) + ":\\", "Users");
+    try {
+      for (const u of fs.readdirSync(usersRoot)) {
+        for (const name of [".workbuddy", ".workbuddy-ai"]) {
+          const dir = path.join(usersRoot, u, name);
+          if (fs.existsSync(dir)) {
+            wbCrossUserDirs.push({ dir, label: name + "(" + u + ")" });
+          }
         }
       }
-    }
-  } catch {}
+    } catch {}
+    wbCrossUserScannedAt = nowMs;
+  }
+  for (const cu of wbCrossUserDirs) {
+    if (!cfgDirs.some(c => c.dir === cu.dir)) cfgDirs.push(cu);
+  }
 
   for (const { dir: cfgDir, label: cfgLabel } of cfgDirs) {
     // 读状态文件 —— state 文件不存在 = 未安装或已卸载，守护绝不碰任何文件。
