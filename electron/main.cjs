@@ -731,16 +731,60 @@ function guardClaude() {
 
 const WB_MEM_VERSION = 999999;
 
-/** 发现配置目录下所有 *_memory.md 档案（包括安装后新出现的）。 */
-function wbFindArchives(configDir) {
-  const memDir = path.join(configDir, "memory");
+/**
+ * 发现指定目录下的记忆档案。
+ * dirType 决定目录名和文件后缀：
+ *   "memory" → 目录 memory/，后缀 _memory.md（旧版 WorkBuddy）
+ *   "memery" → 目录 memery/，后缀 _memery.md（新版 WorkBuddy 因代码拼写错误）
+ */
+function wbListArchives(baseDir, dirType) {
+  const subDir = path.join(baseDir, dirType);
+  const suffix = "_" + dirType + ".md";
   try {
-    return fs.readdirSync(memDir)
-      .filter(n => n.endsWith("_memory.md") && !n.includes(".bak"))
-      .map(n => path.join(memDir, n));
+    return fs.readdirSync(subDir)
+      .filter(n => n.endsWith(suffix) && !n.includes(".bak"))
+      .map(n => path.join(subDir, n));
   } catch {
     return [];
   }
+}
+
+/** 发现配置目录下所有记忆档案（同时扫描 memory 和 memery 目录）。 */
+function wbFindArchives(configDir) {
+  let result = [];
+  // 旧版：memory/_memory.md
+  result = result.concat(wbListArchives(configDir, "memory"));
+  // 新版：memery/_memery.md（拼写错误）
+  result = result.concat(wbListArchives(configDir, "memery"));
+  // 新版 primaryDir：~/.codebuddy/memery/
+  const codebuddyDir = path.join(homedir(), ".codebuddy");
+  if (codebuddyDir !== configDir) {
+    result = result.concat(wbListArchives(codebuddyDir, "memery"));
+  }
+  // 去重
+  return [...new Set(result)];
+}
+
+/**
+ * 根据 memory 目录下的档案路径，返回对应的 memery 镜像路径。
+ * 例如 /path/.workbuddy/memory/uid_memory.md →
+ *   [~/.workbuddy/memery/uid_memery.md, ~/.codebuddy/memery/uid_memery.md, /path/.workbuddy/memery/uid_memery.md]
+ */
+function wbGetMemeryMirrors(archPath) {
+  const baseName = path.basename(archPath);
+  const uid = baseName.replace(/_memory\.md$/, "");
+  const mirrors = [];
+  const home = homedir();
+  // legacyDir
+  mirrors.push(path.join(home, ".workbuddy", "memery", uid + "_memery.md"));
+  // primaryDir
+  mirrors.push(path.join(home, ".codebuddy", "memery", uid + "_memery.md"));
+  // configDir/memery（兼容自定义配置目录）
+  const configDir = path.dirname(path.dirname(archPath));
+  if (configDir !== home) {
+    mirrors.push(path.join(configDir, "memery", uid + "_memery.md"));
+  }
+  return mirrors;
 }
 
 /** 从档案文件解析 RAW_JSON 块。 */
@@ -847,12 +891,38 @@ function wbGuardArchive(archPath, promptText, cfgLabel) {
     try { fs.chmodSync(archPath, 0o444); } catch {}
     if (ok) {
       guardPush("WorkBuddy " + cfgLabel + ": " + path.basename(archPath) + " 已重建 (" + reasons.join(", ") + ")");
+      // 如果重建的是 memory 目录的档案，同时镜像到 memery 目录（新版 WorkBuddy 兼容）
+      if (archPath.endsWith("_memory.md")) {
+        const mirrors = wbGetMemeryMirrors(archPath);
+        for (const mirrorPath of mirrors) {
+          if (path.resolve(mirrorPath) === path.resolve(archPath)) continue; // 避免重复写自己
+          wbWriteMirrorArchive(mirrorPath, newContent, cfgLabel);
+        }
+      }
       return true;
     }
     return false;
   } catch (e) {
     guardPush("WorkBuddy " + cfgLabel + ": " + path.basename(archPath) + " 重建失败: " + String(e.message));
     return false;
+  }
+}
+
+/** 把重建的档案内容写入 memery 镜像路径（创建目录、解除只读、写入、重设只读）。 */
+function wbWriteMirrorArchive(mirrorPath, content, cfgLabel) {
+  try {
+    const mirrorDir = path.dirname(mirrorPath);
+    if (!fs.existsSync(mirrorDir)) {
+      try { fs.mkdirSync(mirrorDir, { recursive: true }); } catch {}
+    }
+    try { fs.chmodSync(mirrorPath, 0o666); } catch {}
+    const ok = writeUtf8WithRetry(mirrorPath, content);
+    try { fs.chmodSync(mirrorPath, 0o444); } catch {}
+    if (ok) {
+      guardPush("WorkBuddy " + cfgLabel + ": " + path.basename(mirrorPath) + " memery 镜像已同步");
+    }
+  } catch (e) {
+    guardPush("WorkBuddy " + cfgLabel + ": memery 镜像失败 " + mirrorPath + ": " + String(e.message));
   }
 }
 

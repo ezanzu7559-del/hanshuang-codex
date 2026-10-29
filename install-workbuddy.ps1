@@ -5,6 +5,9 @@
 #   1) <ConfigDir>\memory\<uid>_memory.md          账号级云记忆档案；memoryBlock 每轮自动包成
 #                                                  <memory>…</memory> 注入系统提示词（上限 10000 字符）
 #                                                  写入 Version: 999999 触发 stale_version 守卫，防云端回写覆盖
+#      └─ 同时镜像到 memery 拼写目录（新版 WorkBuddy 因代码拼写错误用 memery）：
+#         ~/.workbuddy/memery/<uid>_memery.md  (legacyDir)
+#         ~/.codebuddy/memery/<uid>_memery.md  (primaryDir)
 #   2) <ConfigDir>\MEMORY.md                       用户级文件记忆（每轮提醒 AI 主动读，兜底）
 #   3) <ConfigDir>\app\app-config.json             generateMemoryEnabled（云记忆总闸）/ localMemoryEnabled
 #   4) <ConfigDir>\skills\<name>\SKILL.md          用户级 Skills；开关态在 settings.json 的 skillOverrides
@@ -194,6 +197,13 @@ function Find-OtherProfileConfigDirs([string]$primary) {
 
 function Resolve-Uid([string]$explicit, [string]$configDir, [string]$root) {
     if ($explicit) { return $explicit }
+    # 新版 WorkBuddy 拼写为 memery，旧版为 memory；先扫 memery 再扫 memory
+    $memeryDir = Join-Path $configDir 'memery'
+    if (Test-Path -LiteralPath $memeryDir) {
+        $f = Get-ChildItem -LiteralPath $memeryDir -Filter '*_memery.md' -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($f) { return ($f.Name -replace '_memery\.md$', '') }
+    }
     $memDir = Join-Path $configDir 'memory'
     if (Test-Path -LiteralPath $memDir) {
         $f = Get-ChildItem -LiteralPath $memDir -Filter '*_memory.md' -File -ErrorAction SilentlyContinue |
@@ -227,13 +237,14 @@ $InstallRoot = Resolve-InstallRoot $InstallRoot
 # 是否由调用方显式指定了数据目录（国内版固定传 ~/.workbuddy）
 $configDirPinned = -not [string]::IsNullOrWhiteSpace($ConfigDir)
 $ConfigDir = Resolve-ConfigDir $ConfigDir $InstallRoot
-# 跨账户兜底：本账户目录里没有 WorkBuddy 数据（memory 子目录）时，改用它账户下真实存在的那份。
+# 跨账户兜底：本账户目录里没有 WorkBuddy 数据（memory/memery 子目录）时，改用它账户下真实存在的那份。
 # 但显式指定数据目录时不能兜底：国内版固定 ~/.workbuddy，该目录在首次登录前还没有 memory，
 # 一兜底就会切到国际版 ~/.workbuddy-ai（或别的 Windows 账户），整份注入跑到另一个版本上，
 # 表现为「只装国内版时注入有时失败」。
-if (-not $configDirPinned -and -not (Test-Path -LiteralPath (Join-Path $ConfigDir 'memory'))) {
+$hasMemDir = (Test-Path -LiteralPath (Join-Path $ConfigDir 'memory')) -or (Test-Path -LiteralPath (Join-Path $ConfigDir 'memery'))
+if (-not $configDirPinned -and -not $hasMemDir) {
     $others = @(Find-OtherProfileConfigDirs $ConfigDir |
-        Where-Object { Test-Path -LiteralPath (Join-Path $_ 'memory') })
+        Where-Object { (Test-Path -LiteralPath (Join-Path $_ 'memory')) -or (Test-Path -LiteralPath (Join-Path $_ 'memery')) })
     if ($others.Count -gt 0) {
         Write-Host "  [跨账户] 本账户($env:USERPROFILE)无 WorkBuddy 数据，改用: $($others[0])" -ForegroundColor Yellow
         Write-Log "跨账户切换: $ConfigDir -> $($others[0])"
@@ -244,13 +255,20 @@ $Uid = Resolve-Uid $Uid $ConfigDir $InstallRoot
 $memDir = Join-Path $ConfigDir 'memory'
 # 云记忆档案：指定 uid 时用该 uid 的文件（不存在则新建）；未指定则扫描该目录下所有 <uid>_memory.md
 # （换机器/换账号时 uid 不同，靠扫描而不是硬编码，别人的机器同样能用）
+# 同时扫描 memery 目录（新版 WorkBuddy 拼写错误用 memery）
 $archFiles = @()
 if ($Uid) {
     $archFiles = @(Join-Path $memDir "$Uid`_memory.md")
-} elseif (Test-Path -LiteralPath $memDir) {
-    $archFiles = @(Get-ChildItem -LiteralPath $memDir -Filter '*_memory.md' -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -notlike '*.bak*' } |
-        Sort-Object LastWriteTime -Descending | ForEach-Object { $_.FullName })
+} else {
+    foreach ($d in @($memDir, (Join-Path $ConfigDir 'memery'))) {
+        if (Test-Path -LiteralPath $d) {
+            $filter = if ($d -like '*memery') { '*_memery.md' } else { '*_memory.md' }
+            $archFiles += @(Get-ChildItem -LiteralPath $d -Filter $filter -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notlike '*.bak*' } |
+                Sort-Object LastWriteTime -Descending | ForEach-Object { $_.FullName })
+        }
+    }
+    $archFiles = @($archFiles | Select-Object -Unique)
 }
 $fileMem = Join-Path $ConfigDir 'MEMORY.md'
 $fileMemBak = "$fileMem.bak-inject"
@@ -527,6 +545,32 @@ if ($archFiles.Count -gt 0) {
     $steps++
     Write-Host "[$steps] 云记忆档案已注入 memoryBlock：$($archFiles.Count) 个（$($srcText.Trim().Length) 字符，Version $MEM_VERSION，已设只读）" -ForegroundColor Green
     foreach ($af in $archFiles) { Write-Host "      - $af" -ForegroundColor DarkGray }
+
+    # 1b) 镜像到 memery 目录（新版 WorkBuddy 因拼写错误用 memery 而非 memory）
+    # primaryDir = ~/.codebuddy/memery/, legacyDir = ~/.workbuddy/memery/
+    # 文件名用 <uid>_memery.md（不是 _memory.md）
+    # 新版 WorkBuddy 的 UserMemoryArchiveService.getArchiveFilePath 用的是 memery 拼写，
+    # 读取时先找 primaryDir 找不到回退 legacyDir，两个都要写。
+    $homeDir = $env:USERPROFILE
+    $memeryPrimary = Join-Path $homeDir '.codebuddy\memery'
+    $memeryLegacy  = Join-Path $homeDir '.workbuddy\memery'
+    $memeryMirrored = 0
+    foreach ($af in $archFiles) {
+        $uidOfFile = (Split-Path -Leaf $af) -replace '_memory\.md$',''
+        foreach ($memeryDir in @($memeryPrimary, $memeryLegacy, (Join-Path $ConfigDir 'memery'))) {
+            if (-not (Test-Path -LiteralPath $memeryDir)) { New-Item -ItemType Directory -Path $memeryDir -Force | Out-Null }
+            $memeryFile = Join-Path $memeryDir "$uidOfFile`_memery.md"
+            Set-ArchiveReadOnly $memeryFile $false -ErrorAction SilentlyContinue
+            try {
+                Write-Utf8 $memeryFile $md
+                Set-ArchiveReadOnly $memeryFile $true
+                $memeryMirrored++
+            } catch { Write-Log "memery 镜像写入失败: $memeryFile" }
+        }
+    }
+    if ($memeryMirrored -gt 0) {
+        Write-Host "      镜像到 memery 拼写目录: $memeryMirrored 个（新版 WorkBuddy 兼容）" -ForegroundColor DarkGreen
+    }
 } else {
     Write-Host "[1] 云记忆档案未执行：该账号还没有记忆档案文件（WorkBuddy 未登录或从未产生记忆）" -ForegroundColor Yellow
     Write-Host "      处理：先在 WorkBuddy 里发一句话再重跑本脚本；或安装后由 fj_tool 守护自动补注入" -ForegroundColor DarkGray
@@ -597,18 +641,27 @@ if ($NoSkills) {
 }
 
 # 5) 注入状态文件（fj_tool 守护线程据此自动重注入）
+# memery 镜像路径列表（新版 WorkBuddy 拼写错误用 memery）
+$memeryMirrors = @()
+foreach ($af in $archFiles) {
+    $uidOfFile = (Split-Path -Leaf $af) -replace '_memory\.md$',''
+    foreach ($d in @((Join-Path $env:USERPROFILE '.codebuddy\memery'), (Join-Path $env:USERPROFILE '.workbuddy\memery'), (Join-Path $ConfigDir 'memery'))) {
+        $memeryMirrors += (Join-Path $d "$uidOfFile`_memery.md")
+    }
+}
 $state = [ordered]@{
-    prompt       = (Split-Path -Leaf $SourcePrompt)
-    promptSha256 = $srcHash
-    configDir    = $ConfigDir
-    uid          = $Uid
-    memoryDir    = $memDir
-    archives     = $archFiles
-    archive      = $(if ($archFiles.Count -gt 0) { $archFiles[0] } else { '' })
-    memoryFile   = $fileMem
-    appConfig    = $cfgFile
-    version      = $MEM_VERSION
-    skills       = $installedNames
+    prompt        = (Split-Path -Leaf $SourcePrompt)
+    promptSha256  = $srcHash
+    configDir     = $ConfigDir
+    uid            = $Uid
+    memoryDir     = $memDir
+    archives      = $archFiles
+    archive       = $(if ($archFiles.Count -gt 0) { $archFiles[0] } else { '' })
+    memeryMirrors = $memeryMirrors
+    memoryFile    = $fileMem
+    appConfig     = $cfgFile
+    version       = $MEM_VERSION
+    skills        = $installedNames
     installedAt  = $now
 }
 Write-Utf8 $stateFile (($state | ConvertTo-Json -Depth 6) + "`n")
@@ -625,6 +678,15 @@ foreach ($af in @($archFiles | Where-Object { Test-Path -LiteralPath $_ })) {
     Write-Host "  档案 memoryBlock 可解析 : $blockOk  ($(Split-Path -Leaf $af))"
     Write-Host "  档案 RAW_JSON 存在      : $rawOk"
     if (-not ($blockOk -and $rawOk)) { $ok = $false }
+}
+# 校验 memery 镜像
+$memeryOkCount = 0
+foreach ($mf in @($memeryMirrors | Where-Object { Test-Path -LiteralPath $_ })) {
+    $t = Read-Utf8 $mf
+    if ((Get-MemoryBlockBody $t).Trim() -eq $srcText.Trim()) { $memeryOkCount++ }
+}
+if ($memeryOkCount -gt 0) {
+    Write-Host "  memery 镜像一致         : $memeryOkCount 个（新版 WorkBuddy 兼容）" -ForegroundColor DarkGreen
 }
 $c = Read-Utf8 $cfgFile | ConvertFrom-Json
 Write-Host "  generateMemoryEnabled   : $($c.generateMemoryEnabled)"
