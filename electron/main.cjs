@@ -900,8 +900,11 @@ function wbGuardMemoryFile(memFile, promptText, cfgLabel, stateExists) {
   if (current === expected) return;
 
   // state 存在 + 内容不匹配 = 被覆写了 → 无条件恢复
-  writeUtf8WithRetry(memFile, promptText.trimEnd() + "\n");
-  guardPush("WorkBuddy " + cfgLabel + ": MEMORY.md 已恢复（内容被覆写）");
+  const ok = writeUtf8WithRetry(memFile, promptText.trimEnd() + "\n");
+  if (ok) {
+    guardPush("WorkBuddy " + cfgLabel + ": MEMORY.md 已恢复（内容被覆写）");
+  }
+  // 写入失败时 writeUtf8WithRetry 自己会记日志，这里不重复
 }
 
 /** WorkBuddy 守护主函数。 */
